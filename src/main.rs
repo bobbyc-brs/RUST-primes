@@ -16,18 +16,21 @@ fn print_usage(program: &str) {
     eprintln!();
     eprintln!("Options:");
     eprintln!("  --threads=N     Number of worker threads (default: number of CPU cores)");
+    eprintln!("  --progress[=N]  Show progress every N seconds (default: 5)");
     eprintln!("  --list          Print all found primes");
     eprintln!("  --help          Show this help message");
     eprintln!();
     eprintln!("Examples:");
     eprintln!("  {} 1000                  Find primes up to 1000", program);
     eprintln!("  {} 1000000 --threads=8   Use 8 threads", program);
+    eprintln!("  {} 1000000 --progress    Show progress every 5 seconds", program);
     eprintln!("  {} 100 --list            Print all primes up to 100", program);
 }
 
 struct Args {
     max_n: u64,
     threads: Option<usize>,
+    progress_interval: Option<u64>,
     list_primes: bool,
 }
 
@@ -42,6 +45,7 @@ fn parse_args() -> Result<Args, String> {
 
     let mut max_n: Option<u64> = None;
     let mut threads: Option<usize> = None;
+    let mut progress_interval: Option<u64> = None;
     let mut list_primes = false;
 
     for arg in &args[1..] {
@@ -50,6 +54,16 @@ fn parse_args() -> Result<Args, String> {
             process::exit(0);
         } else if arg == "--list" {
             list_primes = true;
+        } else if arg == "--progress" {
+            progress_interval = Some(5); // Default 5 seconds
+        } else if let Some(value) = arg.strip_prefix("--progress=") {
+            let secs: u64 = value
+                .parse()
+                .map_err(|_| format!("Invalid progress interval: {}", value))?;
+            if secs == 0 {
+                return Err("Progress interval must be at least 1 second".to_string());
+            }
+            progress_interval = Some(secs);
         } else if let Some(value) = arg.strip_prefix("--threads=") {
             threads = Some(
                 value
@@ -84,6 +98,7 @@ fn parse_args() -> Result<Args, String> {
     Ok(Args {
         max_n,
         threads,
+        progress_interval,
         list_primes,
     })
 }
@@ -101,6 +116,9 @@ fn main() {
     let mut config = CalculatorConfig::new(args.max_n);
     if let Some(threads) = args.threads {
         config = config.with_threads(threads);
+    }
+    if let Some(interval) = args.progress_interval {
+        config = config.with_progress_interval(interval);
     }
 
     // Report configuration

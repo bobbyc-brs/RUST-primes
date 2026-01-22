@@ -1,4 +1,6 @@
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::prime_cache::{new_shared_cache, SharedPrimeCache};
@@ -13,6 +15,8 @@ pub struct CalculatorConfig {
     pub max_n: u64,
     /// Number of worker threads (None = use CPU count)
     pub num_threads: Option<usize>,
+    /// Progress update interval in seconds (None = no progress updates)
+    pub progress_interval: Option<u64>,
 }
 
 impl CalculatorConfig {
@@ -20,11 +24,17 @@ impl CalculatorConfig {
         Self {
             max_n,
             num_threads: None,
+            progress_interval: None,
         }
     }
 
     pub fn with_threads(mut self, threads: usize) -> Self {
         self.num_threads = Some(threads);
+        self
+    }
+
+    pub fn with_progress_interval(mut self, seconds: u64) -> Self {
+        self.progress_interval = Some(seconds);
         self
     }
 }
@@ -77,6 +87,35 @@ impl PrimeCalculator {
         let pool = ThreadPool::new(num_threads);
         let (result_tx, result_rx) = mpsc::channel::<BatchResult>();
 
+        // Spawn progress reporter thread if configured
+        let stop_progress = Arc::new(AtomicBool::new(false));
+        let progress_handle = self.config.progress_interval.map(|interval_secs| {
+            let cache = self.cache.clone();
+            let max_n = self.config.max_n;
+            let stop = stop_progress.clone();
+            let start_time = start;
+
+            thread::spawn(move || {
+                let interval = Duration::from_secs(interval_secs);
+                while !stop.load(Ordering::Relaxed) {
+                    thread::sleep(interval);
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+
+                    let confirmed = cache.get_confirmed_up_to();
+                    let prime_count = cache.prime_count();
+                    let elapsed = start_time.elapsed();
+                    let percent = (confirmed as f64 / max_n as f64) * 100.0;
+
+                    eprintln!(
+                        "Progress: {:.1}% ({}/{}) | Primes: {} | Elapsed: {:.1}s",
+                        percent, confirmed, max_n, prime_count, elapsed.as_secs_f64()
+                    );
+                }
+            })
+        });
+
         // Calculate number of remaining batches (starting from batch 1)
         let num_batches = (self.config.max_n / WHEEL_PERIOD) + 1;
 
@@ -102,6 +141,12 @@ impl PrimeCalculator {
 
         // Wait for pool to finish (happens on drop)
         drop(pool);
+
+        // Stop progress reporter
+        stop_progress.store(true, Ordering::Relaxed);
+        if let Some(handle) = progress_handle {
+            let _ = handle.join();
+        }
 
         CalculatorStats {
             max_n: self.config.max_n,

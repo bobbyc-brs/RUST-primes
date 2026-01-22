@@ -15,6 +15,10 @@ pub struct PrimeCache {
     /// Workers can proceed if confirmed_up_to >= sqrt(n).
     confirmed_up_to: AtomicU64,
 
+    /// Minimum batch base currently in progress (for status reporting)
+    /// Uses u64::MAX to indicate no batches in progress
+    min_in_progress: AtomicU64,
+
     /// Condition variable for workers waiting on progress
     progress_condvar: Condvar,
     progress_mutex: Mutex<()>,
@@ -26,6 +30,7 @@ impl PrimeCache {
         Self {
             primes: RwLock::new(vec![2, 3, 5, 7, 11]),
             confirmed_up_to: AtomicU64::new(11),
+            min_in_progress: AtomicU64::new(u64::MAX),
             progress_condvar: Condvar::new(),
             progress_mutex: Mutex::new(()),
         }
@@ -46,6 +51,7 @@ impl PrimeCache {
         Self {
             primes: RwLock::new(primes),
             confirmed_up_to: AtomicU64::new(11),
+            min_in_progress: AtomicU64::new(u64::MAX),
             progress_condvar: Condvar::new(),
             progress_mutex: Mutex::new(()),
         }
@@ -139,6 +145,22 @@ impl PrimeCache {
     /// Get current confirmation progress
     pub fn get_confirmed_up_to(&self) -> u64 {
         self.confirmed_up_to.load(Ordering::Acquire)
+    }
+
+    /// Update min_in_progress if this batch is lower than current min
+    pub fn update_min_in_progress(&self, batch_base: u64) {
+        self.min_in_progress.fetch_min(batch_base, Ordering::AcqRel);
+    }
+
+    /// Clear min_in_progress (set to MAX) - call when all batches done
+    pub fn clear_min_in_progress(&self) {
+        self.min_in_progress.store(u64::MAX, Ordering::Release);
+    }
+
+    /// Get current min_in_progress (returns None if no batches in progress)
+    pub fn get_min_in_progress(&self) -> Option<u64> {
+        let val = self.min_in_progress.load(Ordering::Acquire);
+        if val == u64::MAX { None } else { Some(val) }
     }
 
     /// Get the number of primes found so far
