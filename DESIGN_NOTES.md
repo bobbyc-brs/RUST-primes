@@ -89,3 +89,201 @@ The (3, 7, 11) wheel with runtime filtering provides:
 - Slightly better candidate ratio (20.8% vs 22.9%)
 - Simpler iteration model (no lookup)
 - Natural batch size for parallel dispatch
+
+## Thread Pool Rationale
+
+### Why a Thread Pool?
+
+**Alternative 1: Spawn a thread per candidate**
+```rust
+for n in candidates {
+    std::thread::spawn(move || check_prime(n));
+}
+```
+Problems:
+- Thread creation overhead (~10-50μs per spawn on Linux)
+- OS scheduler thrashing with thousands of threads
+- Stack allocation per thread (~2MB default on Linux)
+- For 1 million candidates: 1M threads = ~2TB virtual memory
+
+**Alternative 2: Single-threaded**
+- Leaves N-1 cores idle
+- Primality testing is CPU-bound and embarrassingly parallel
+- Wasted hardware
+
+**Alternative 3: Thread pool (chosen)**
+- Fixed number of threads (typically = CPU cores)
+- Threads are reused across many tasks
+- Work is distributed via channels
+- Minimal overhead: one channel send/receive per batch
+
+### Pool Size Considerations
+
+Default: `num_cpus::get()` (logical cores including hyperthreads)
+
+Hyperthreading tradeoff:
+- Trial division is ALU-heavy, benefits somewhat from HT
+- Memory access (reading prime cache) may benefit from HT hiding latency
+- Recommendation: default to logical cores, allow CLI override for tuning
+
+### Work Stealing vs Fixed Assignment
+
+**Fixed assignment** (simpler):
+- Each batch goes to one worker
+- Workers pull from a shared queue
+- Potential imbalance if some batches take longer
+
+**Work stealing** (more complex):
+- Workers can steal from other workers' queues
+- Better load balancing
+- Libraries like `rayon` provide this
+
+For our design: Start with fixed assignment via channels. The batch size (231 numbers, ~48 candidates) is small enough that imbalance is minimal. Consider `rayon` if profiling shows load imbalance.
+
+## PrimeCache Design
+
+### The Core Problem
+
+Workers need read access to discovered primes for trial division, but also need to write new primes when found. This is a classic readers-writer problem with an ordering constraint.
+
+### Naive Approach: `Mutex<Vec<u64>>`
+
+```rust
+let cache = Arc::new(Mutex::new(Vec::new()));
+```
+
+Problems:
+- Every read locks out all other readers
+- Trial division reads many primes per candidate
+- Workers serialize, destroying parallelism
+
+### Better: `RwLock<Vec<u64>>`
+
+```rust
+let cache = Arc::new(RwLock::new(Vec::new()));
+```
+
+- Multiple readers can hold the lock simultaneously
+- Only writers need exclusive access
+- Much better for read-heavy workloads
+
+**But still has issues:**
+- Writers block all readers (and vice versa)
+- Frequent small writes (each new prime) cause contention
+
+### Optimized Design: Separate Concerns
+
+Split the cache into components with different synchronization needs:
+
+```rust
+struct PrimeCache {
+    // The actual prime storage - rarely written in bulk
+    primes: RwLock<Vec<u64>>,
+
+    // Progress tracking - updated atomically, read frequently
+    confirmed_up_to: AtomicU64,
+
+    // Notification for waiting workers
+    progress_condvar: Condvar,
+    progress_mutex: Mutex<()>,  // Condvar requires a mutex
+}
+```
+
+**Why this helps:**
+
+1. **`confirmed_up_to: AtomicU64`**
+   - Workers check `confirmed_up_to >= sqrt(n)` before proceeding
+   - Atomic read: no lock, no contention
+   - Updated only when a batch completes (not per-prime)
+
+2. **`primes: RwLock<Vec<u64>>`**
+   - Readers acquire read lock, iterate for trial division
+   - Writers acquire write lock only to append new primes
+   - Writes are batched: worker collects primes from batch, writes once
+
+3. **`Condvar` for waiting**
+   - Workers processing high numbers wait for lower batches to complete
+   - `Condvar::wait()` sleeps the thread (no busy-waiting)
+   - `Condvar::notify_all()` wakes waiters when progress is made
+
+### Memory Layout Considerations
+
+```rust
+primes: Vec<u64>
+```
+
+- Contiguous memory: cache-friendly iteration
+- Append-only: no reallocation churn once capacity stabilizes
+- Pre-allocate based on prime number theorem: `capacity ≈ max / ln(max)`
+
+### Batch Writes to Reduce Contention
+
+Instead of:
+```rust
+// Bad: lock per prime
+for n in batch_results {
+    if n.is_prime {
+        cache.primes.write().push(n.value);  // Lock acquired/released each time
+    }
+}
+```
+
+Do:
+```rust
+// Good: collect then write once
+let new_primes: Vec<u64> = batch_results
+    .iter()
+    .filter(|r| r.is_prime)
+    .map(|r| r.value)
+    .collect();
+
+{
+    let mut primes = cache.primes.write();
+    primes.extend(new_primes);
+}  // Lock released
+
+cache.confirmed_up_to.store(batch_end, Ordering::Release);
+cache.progress_condvar.notify_all();
+```
+
+### The Ordering Constraint
+
+Workers checking number `n` need all primes up to `√n`. This creates a dependency:
+
+```
+Batch 0 (0-230)    → finds primes 2, 3, 5, 7, 11, ...
+Batch 1 (231-461)  → needs primes up to √461 ≈ 21 → must wait for batch 0
+Batch 2 (462-692)  → needs primes up to √692 ≈ 26 → must wait for batch 0
+...
+Batch 44 (10164-10394) → needs primes up to √10394 ≈ 102 → must wait for batches finding primes up to 102
+```
+
+**Implication:** Early batches are sequential, but parallelism increases rapidly. By batch ~44, workers rarely wait because primes up to ~100 are long since confirmed.
+
+### Wait Strategy
+
+```rust
+fn wait_for_sqrt(&self, n: u64) {
+    let sqrt_n = (n as f64).sqrt() as u64;
+
+    loop {
+        // Fast path: atomic check, no lock
+        if self.confirmed_up_to.load(Ordering::Acquire) >= sqrt_n {
+            return;
+        }
+
+        // Slow path: sleep until progress
+        let guard = self.progress_mutex.lock().unwrap();
+        // Re-check after acquiring mutex (avoid race)
+        if self.confirmed_up_to.load(Ordering::Acquire) >= sqrt_n {
+            return;
+        }
+        self.progress_condvar.wait(guard).unwrap();
+    }
+}
+```
+
+**Why this pattern:**
+1. Fast path avoids mutex entirely (common case once warmed up)
+2. Slow path sleeps instead of spinning (saves CPU)
+3. Re-check after mutex prevents missed-wakeup race
