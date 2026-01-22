@@ -352,3 +352,143 @@ Workers would:
 3. Readers check if `√n < min_in_progress` — if so, safe to read without full lock
 
 This optimization is deferred until profiling shows lock contention is a bottleneck.
+
+## Progress Reporting
+
+### Design Goals
+
+For long-running calculations, users need visibility into progress without impacting performance.
+
+### Implementation: Separate Thread
+
+```rust
+let progress_handle = config.progress_interval.map(|interval_secs| {
+    thread::spawn(move || {
+        while !stop.load(Ordering::Relaxed) {
+            thread::sleep(interval);
+            // Report progress...
+        }
+    })
+});
+```
+
+**Why a separate thread:**
+- Doesn't block or slow down worker threads
+- Can sleep independently of calculation pace
+- Clean shutdown via `AtomicBool` flag
+
+**Why `Option<u64>` for the interval:**
+
+The `progress_interval` field uses `Option<u64>` rather than a sentinel value like `-1`:
+
+| Approach | Memory | Runtime Cost |
+|----------|--------|--------------|
+| `Option<u64>` | 16 bytes | One-time check at startup |
+| `i64` with `-1` sentinel | 8 bytes | Same one-time check |
+
+The 8-byte overhead is negligible for a config field. Benefits of `Option`:
+- Type-safe: can't accidentally use sentinel as real value
+- Self-documenting: type signature shows "might be absent"
+- Compiler-enforced: must handle `None` case
+
+Once the thread spawns, it captures a plain `u64` interval—no `Option` overhead in the hot path.
+
+## Square Root Implementation
+
+### The Problem
+
+Trial division needs `√n` to know when to stop checking factors. For `u64` values, we need a correct integer square root.
+
+### Naive Approach: f64
+
+```rust
+let sqrt_n = (n as f64).sqrt() as u64;
+```
+
+**Fast** (~15 CPU cycles), but **loses precision above 2^53** because f64 has only 53 bits of mantissa. For `n > 2^53`, the conversion `n as f64` rounds, potentially giving wrong sqrt.
+
+### Naive Approach: Pure Integer Newton
+
+```rust
+loop {
+    let x1 = (x + n / x) / 2;
+    if x1 >= x { return x; }
+    x = x1;
+}
+```
+
+**Correct** for all u64, but **slower** (~6 iterations × division cost).
+
+### Chosen Approach: Hybrid with Monitoring
+
+```rust
+fn fast_sqrt(n: u64) -> u64 {
+    let f64_guess = (n as f64).sqrt() as u64;
+
+    // Try f64 with correction loop
+    let mut sqrt_n = f64_guess;
+    while sqrt_n * sqrt_n > n { sqrt_n -= 1; }
+    while (sqrt_n + 1) * (sqrt_n + 1) <= n { sqrt_n += 1; }
+
+    sqrt_n
+}
+```
+
+**Benefits:**
+- Fast path: f64 is exact for n < 2^53 (correction loops execute 0 times)
+- Safe: correction handles any f64 imprecision
+- Monitored: if corrections exceed threshold, switch to Newton
+
+### Newton's Method: Two-Phase Design
+
+When `fast_sqrt` falls back to Newton, we pass the f64 estimate as an initial guess:
+
+```rust
+fn integer_sqrt(n: u64, guess: Option<u64>) -> u64 {
+    // Phase 1: If below sqrt(n), Newton steps upward until we're at/above
+    while x.saturating_mul(x) < n {
+        x = (x + n / x) / 2;
+    }
+
+    // Phase 2: Standard Newton convergence from above
+    loop {
+        let x1 = (x + n / x) / 2;
+        if x1 >= x { return x; }
+        x = x1;
+    }
+}
+```
+
+**Why two phases with the same formula?**
+
+This is subtle and worth documenting. Newton's method for sqrt: `x_new = (x + n/x) / 2`
+
+The standard termination `x1 >= x` assumes convergence from ABOVE:
+- If `x > √n`: then `n/x < √n`, so `x1 = (x + n/x)/2 < x` (decreases)
+- If `x = √n`: then `x1 = x` (stable)
+- If `x < √n`: then `n/x > √n`, so `x1 > x` (increases!)
+
+The problem: when starting below √n, the first iteration jumps UP, and `x1 >= x` triggers immediately—returning the wrong answer.
+
+**Solution:** Two phases with different termination conditions:
+- Phase 1: `x*x < n` — keep iterating until we're AT or ABOVE √n
+- Phase 2: `x1 >= x` — standard Newton convergence from above
+
+Both use the identical Newton formula. Phase 1 ensures we reach a valid starting point for phase 2's termination condition.
+
+**Example trace for n=100, guess=9:**
+```
+Phase 1: x=9, x²=81 < 100
+         x = (9 + 100/9) / 2 = 10
+         x=10, x²=100, not < 100, exit phase 1
+Phase 2: x1 = (10 + 100/10) / 2 = 10
+         x1 >= x, return 10 ✓
+```
+
+**Example trace for n=10000, guess=1:**
+```
+Phase 1: x=1, x²=1 < 10000
+         x = (1 + 10000/1) / 2 = 5000
+         x²=25000000 > 10000, exit phase 1
+Phase 2: converges 5000 → 2501 → 1252 → ... → 100 ✓
+```
