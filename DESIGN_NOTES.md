@@ -287,3 +287,68 @@ fn wait_for_sqrt(&self, n: u64) {
 1. Fast path avoids mutex entirely (common case once warmed up)
 2. Slow path sleeps instead of spinning (saves CPU)
 3. Re-check after mutex prevents missed-wakeup race
+
+### Sorted Insert Optimization
+
+Batches may complete out of order. A batch processing numbers 1000-1230 might finish before a batch processing 500-730. If we just append primes, the list becomes unsorted.
+
+**Naive fix:** Sort on every read — expensive, O(n log n) per read.
+
+**Better fix:** Maintain sorted order on insert.
+
+**Naive insert:** Insert each prime individually with `Vec::insert()` — O(n) per prime, O(n × m) total.
+
+**Efficient insert:** Bulk insert with single shift:
+
+```rust
+pub fn add_primes(&self, new_primes: &[u64]) {
+    // Sort incoming batch
+    let mut sorted_new = new_primes.to_vec();
+    sorted_new.sort_unstable();
+
+    let mut primes = self.primes.write().unwrap();
+
+    // Find insertion point for smallest new prime (search from end)
+    let first = sorted_new[0];
+    let mut insert_pos = primes.len();
+    while insert_pos > 0 && primes[insert_pos - 1] > first {
+        insert_pos -= 1;
+    }
+
+    // Bulk insert: splice shifts tail once, inserts all new primes
+    primes.splice(insert_pos..insert_pos, sorted_new);
+}
+```
+
+**Why this works:**
+- All primes from one batch are contiguous in the number line
+- They all insert at the same position in the sorted list
+- `splice` does one shift of the tail, then copies the batch in
+- O(n) for the shift + O(m log m) for sorting the batch
+
+**Searching from the end:** New primes are typically larger than most existing ones, so searching backwards finds the insertion point faster.
+
+### Safe List Portion for Readers (TODO)
+
+**Problem:** When a reader is iterating the prime list for trial division, a writer might insert primes in the middle (due to out-of-order batch completion). This could cause issues if the reader is mid-iteration.
+
+**Current mitigation:** `RwLock` prevents concurrent read/write.
+
+**Future optimization:** Track `min_in_progress` — the minimum number currently being calculated by any worker thread. Primes below this value are "stable" (no batch will insert there). Readers doing trial division only need primes up to `√n`, which is much smaller than `n`. If `√n < min_in_progress`, the reader can safely iterate without lock contention.
+
+**Implementation sketch:**
+```rust
+struct PrimeCache {
+    primes: RwLock<Vec<u64>>,
+    confirmed_up_to: AtomicU64,
+    min_in_progress: AtomicU64,  // Track minimum batch base across all workers
+    // ...
+}
+```
+
+Workers would:
+1. Register their batch base with `min_in_progress` on start
+2. Deregister on completion
+3. Readers check if `√n < min_in_progress` — if so, safe to read without full lock
+
+This optimization is deferred until profiling shows lock contention is a bottleneck.
