@@ -1,5 +1,96 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
+
+/// Maximum iterations before switching to Newton's method
+const SQRT_CORRECTION_LIMIT: u32 = 10;
+
+/// Global flag: set to true if f64 sqrt correction ever exceeds threshold
+static SQRT_FALLBACK_TRIGGERED: AtomicBool = AtomicBool::new(false);
+
+/// Integer square root using Newton's method.
+/// If `guess` is provided and non-zero, use it as starting point.
+///
+/// # Why two phases with the same formula?
+///
+/// Newton's method for sqrt: `x_new = (x + n/x) / 2`
+///
+/// The standard termination `x1 >= x` assumes we're converging from ABOVE.
+/// When starting below sqrt(n), the first iteration jumps UP (since n/x > x
+/// when x < sqrt(n)), and `x1 >= x` triggers immediately - returning the
+/// wrong answer.
+///
+/// Solution: Two phases with different termination conditions:
+/// - Phase 1: `x*x < n` - keep iterating until we're AT or ABOVE sqrt(n)
+/// - Phase 2: `x1 >= x` - standard Newton convergence from above
+///
+/// Both use the identical Newton formula, but phase 1 ensures we reach
+/// a valid starting point for phase 2's termination condition.
+fn integer_sqrt(n: u64, guess: Option<u64>) -> u64 {
+    if n < 2 {
+        return n;
+    }
+    let mut x = match guess {
+        Some(g) if g > 0 => g,
+        _ => if n >= 1 << 32 { 1u64 << 32 } else { n },
+    };
+
+    // Phase 1: If below sqrt(n), Newton steps upward until we're at/above
+    while x.saturating_mul(x) < n {
+        x = (x + n / x) / 2;
+    }
+
+    // Phase 2: Standard Newton convergence from above
+    loop {
+        let x1 = (x + n / x) / 2;
+        if x1 >= x {
+            return x;
+        }
+        x = x1;
+    }
+}
+
+/// Fast sqrt: uses f64 with correction loop, falls back to Newton if trouble
+fn fast_sqrt(n: u64) -> u64 {
+    let f64_guess = (n as f64).sqrt() as u64;
+
+    // If we've previously hit trouble, go straight to Newton with f64 hint
+    if SQRT_FALLBACK_TRIGGERED.load(Ordering::Relaxed) {
+        return integer_sqrt(n, Some(f64_guess));
+    }
+
+    let mut sqrt_n = f64_guess;
+    let mut iterations = 0u32;
+
+    // Adjust down if too high
+    while sqrt_n.saturating_mul(sqrt_n) > n {
+        sqrt_n -= 1;
+        iterations += 1;
+        if iterations > SQRT_CORRECTION_LIMIT {
+            eprintln!(
+                "WARNING: sqrt correction exceeded {} iterations for n={}, switching to Newton",
+                SQRT_CORRECTION_LIMIT, n
+            );
+            SQRT_FALLBACK_TRIGGERED.store(true, Ordering::Relaxed);
+            return integer_sqrt(n, Some(f64_guess));
+        }
+    }
+
+    // Adjust up if too low
+    while (sqrt_n + 1).saturating_mul(sqrt_n + 1) <= n {
+        sqrt_n += 1;
+        iterations += 1;
+        if iterations > SQRT_CORRECTION_LIMIT {
+            eprintln!(
+                "WARNING: sqrt correction exceeded {} iterations for n={}, switching to Newton",
+                SQRT_CORRECTION_LIMIT, n
+            );
+            SQRT_FALLBACK_TRIGGERED.store(true, Ordering::Relaxed);
+            return integer_sqrt(n, Some(f64_guess));
+        }
+    }
+
+    sqrt_n
+}
 
 /// Thread-safe cache of discovered prime numbers.
 ///
@@ -60,7 +151,7 @@ impl PrimeCache {
     /// Wait until we have confirmed all primes up to at least sqrt(n).
     /// Uses fast atomic check, falls back to condvar sleep if needed.
     pub fn wait_for_sqrt(&self, n: u64) {
-        let sqrt_n = (n as f64).sqrt() as u64;
+        let sqrt_n = fast_sqrt(n);
 
         // Fast path: check atomically without any lock
         if self.confirmed_up_to.load(Ordering::Acquire) >= sqrt_n {
@@ -91,7 +182,7 @@ impl PrimeCache {
             return false;
         }
 
-        let sqrt_n = (n as f64).sqrt() as u64;
+        let sqrt_n = fast_sqrt(n);
         let primes = self.primes.read().unwrap();
 
         for &p in primes.iter() {
@@ -239,5 +330,40 @@ mod tests {
         let cache = PrimeCache::new();
         // confirmed_up_to is 11, sqrt(100) = 10, so should return immediately
         cache.wait_for_sqrt(100);
+    }
+
+    #[test]
+    fn integer_sqrt_is_correct() {
+        // No guess
+        assert_eq!(integer_sqrt(0, None), 0);
+        assert_eq!(integer_sqrt(1, None), 1);
+        assert_eq!(integer_sqrt(4, None), 2);
+        assert_eq!(integer_sqrt(u64::MAX, None), 4294967295); // 2^32 - 1
+
+        // Good guesses
+        assert_eq!(integer_sqrt(100, Some(10)), 10);
+        assert_eq!(integer_sqrt(100, Some(9)), 10);
+        assert_eq!(integer_sqrt(100, Some(11)), 10);
+
+        // Bad guesses - way too low
+        assert_eq!(integer_sqrt(10000, Some(1)), 100);
+        assert_eq!(integer_sqrt(1000000, Some(5)), 1000);
+
+        // Bad guesses - way too high
+        assert_eq!(integer_sqrt(100, Some(1000)), 10);
+        assert_eq!(integer_sqrt(16, Some(1000000)), 4);
+    }
+
+    #[test]
+    fn fast_sqrt_is_correct() {
+        assert_eq!(fast_sqrt(0), 0);
+        assert_eq!(fast_sqrt(1), 1);
+        assert_eq!(fast_sqrt(4), 2);
+        assert_eq!(fast_sqrt(9), 3);
+        assert_eq!(fast_sqrt(10), 3);
+        assert_eq!(fast_sqrt(100), 10);
+        assert_eq!(fast_sqrt(1_000_000), 1000);
+        // Perfect square near f64 precision limit
+        assert_eq!(fast_sqrt(9_007_199_254_740_992), 94906265);
     }
 }
